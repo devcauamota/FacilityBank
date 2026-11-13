@@ -1,0 +1,103 @@
+/* FaciliteBank_dados_demo.sql - dados de demonstracao da Bia no SQL Server.
+ *
+ * Rode DEPOIS de FaciliteBank.sql (que cria o banco e as tabelas).
+ * E seguro rodar mais de uma vez: cada bloco so insere se ainda nao existe.
+ *
+ * Conta de teste (a mesma do modo demonstracao):
+ *   CPF 529.982.247-25   senha 4826
+ *
+ * A senha NUNCA e gravada em texto: o script gera um sal aleatorio e guarda
+ * o SHA-256 de (sal + senha), igual ao que db_pin_confere() em src/db.c confere.
+ *
+ * Nao modelado no esquema (fica so em banco.c): limite e fatura do cartao,
+ * extrato lancamento a lancamento, apelido dos beneficiarios e alertas.
+ */
+USE FaciliteBank;
+GO
+
+SET XACT_ABORT ON;
+GO
+
+/* A partir daqui tudo roda num unico lote (GO apagaria as variaveis). */
+DECLARE @salt  CHAR(32),
+        @id    INT,
+        @maria INT,
+        @conta INT;
+
+/* 1. Cliente e conta: Maria Aparecida Silva */
+IF NOT EXISTS (SELECT 1 FROM dbo.CLIENTE WHERE cpf = '52998224725')
+BEGIN
+    SET @salt = CONVERT(CHAR(32), CRYPT_GEN_RANDOM(16), 2);
+
+    BEGIN TRAN;
+
+    INSERT INTO dbo.CLIENTE (nome, cpf, data_nascimento, telefone, senha_salt, senha_hash)
+    VALUES (N'Maria Aparecida Silva', '52998224725', '1951-03-12', '11991234567', @salt,
+            CONVERT(CHAR(64), HASHBYTES('SHA2_256', CONCAT(@salt, '4826')), 2));
+
+    SET @id = SCOPE_IDENTITY();
+
+    INSERT INTO dbo.CONTA (id_cliente, numero, saldo, data_abertura)
+    VALUES (@id, '004217-5', 2350.00, '2019-02-03');
+
+    COMMIT;
+END
+
+SELECT @maria = id_cliente FROM dbo.CLIENTE WHERE cpf = '52998224725';
+SELECT @conta = id_conta   FROM dbo.CONTA   WHERE id_cliente = @maria;
+
+/* 2. Beneficiarios (chaves Pix salvas). O apelido ("Filha Ana") nao existe no esquema. */
+IF NOT EXISTS (SELECT 1 FROM dbo.BENEFICIARIO WHERE id_cliente = @maria)
+BEGIN
+    INSERT INTO dbo.BENEFICIARIO (id_cliente, nome, chave_pix) VALUES
+        (@maria, N'Ana Beatriz Silva',    'ana.silva@email.com'),
+        (@maria, N'Joao Pedro Alves',     '11144477735'),
+        (@maria, N'Padaria Bom Pao LTDA', '11987654321');
+END
+
+/* 3. Pix enviado: 16/10, R$ 150,00 para Joao Pedro. (O Pix recebido de Ana nao entra:
+ *    TRANSACAO_PIX so guarda saidas, pois exige um beneficiario.) */
+IF NOT EXISTS (SELECT 1 FROM dbo.TRANSACAO_PIX WHERE id_conta = @conta)
+BEGIN
+    INSERT INTO dbo.TRANSACAO_PIX (id_conta, id_beneficiario, valor, data_hora, status)
+    SELECT @conta, id_beneficiario, 150.00, '2026-10-16T11:11:00', 1
+    FROM dbo.BENEFICIARIO
+    WHERE id_cliente = @maria AND chave_pix = '11144477735';
+END
+
+/* 4. Boletos em aberto. O codigo de barras (47 digitos) segue a mesma formula de semear_boleto()
+ *    em banco.c: digito i = (seed*7 + i*3 + i/5) % 10. */
+IF NOT EXISTS (SELECT 1 FROM dbo.BOLETO WHERE id_conta = @conta)
+BEGIN
+    DECLARE @b TABLE (seed INT, cedente NVARCHAR(100), valor DECIMAL(15,2), venc DATE);
+
+    INSERT INTO @b (seed, cedente, valor, venc) VALUES
+        (1, N'CEMIG Energia',               187.45, '2026-10-19'),
+        (2, N'Condominio Res. Flores',      540.00, '2026-10-28'),
+        (3, N'Fatura Cartao Facility Bank', 612.30, '2026-10-25');
+
+    ;WITH n AS (
+        SELECT TOP (47) CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS INT) AS i
+        FROM sys.all_objects
+    ),
+    cod AS (
+        SELECT b.cedente, b.valor, b.venc,
+               STRING_AGG(CAST((b.seed * 7 + n.i * 3 + n.i / 5) % 10 AS CHAR(1)), '')
+                   WITHIN GROUP (ORDER BY n.i) AS codigo
+        FROM @b b CROSS JOIN n
+        GROUP BY b.seed, b.cedente, b.valor, b.venc
+    )
+    INSERT INTO dbo.BOLETO (id_conta, codigo_barras, valor, vencimento, status)
+    SELECT @conta, codigo, valor, venc, 0
+    FROM cod;
+END
+
+/* 5. Cartao de credito final 4321 */
+IF NOT EXISTS (SELECT 1 FROM dbo.CARTAO WHERE id_conta = @conta)
+BEGIN
+    INSERT INTO dbo.CARTAO (id_conta, numero, tipo, status)
+    VALUES (@conta, '************4321', 'Credito', 1);
+END
+
+PRINT 'Dados de demonstracao carregados (CPF 529.982.247-25, senha 4826).';
+GO
